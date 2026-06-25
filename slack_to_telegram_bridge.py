@@ -741,16 +741,46 @@ def backfill_channel(channel: str) -> None:
     )
 
 
+def _fetch_slack_message(channel: str, ts: str) -> dict | None:
+    """Re-read a single Slack message (including its ``files``) by ``channel`` + ``ts``.
+
+    The realtime CSV stores only text, so attachments have to be recovered from
+    Slack itself at replay time. Returns the message dict, or None if it can't be
+    re-read (e.g. it was deleted, or it lives inside a thread that
+    conversations.history doesn't surface).
+    """
+    if not channel or not ts:
+        return None
+    try:
+        resp = _slack_call(
+            app.client.conversations_history,
+            channel=channel,
+            latest=ts,
+            inclusive=True,
+            limit=1,
+        )
+    except SlackApiError as exc:
+        print(f"  could not re-read {channel}:{ts} from Slack: {exc}")
+        return None
+    for msg in resp.get("messages", []):
+        if msg.get("ts") == ts:
+            return msg
+    return None
+
+
 def replay_failed_realtime() -> None:
     """Re-send realtime messages previously logged as ``failed`` to the live thread.
 
     Reads ``REALTIME_CSV``, finds rows marked ``failed`` whose ``channel:ts`` was
-    never later recorded as ``sent``, and re-posts each one's text to the live
-    Telegram thread. Each successful resend is appended to the ledger as a new
-    ``sent`` row (the ledger is append-only), so the next run skips it.
+    never later recorded as ``sent``, and re-posts each one to the live Telegram
+    thread. Each successful resend is appended to the ledger as a new ``sent`` row
+    (the ledger is append-only), so the next run skips it.
 
-    Only the message text is replayed — the CSV does not store attachments, so
-    image/file-only messages (blank text) can't be reconstructed and are skipped.
+    The CSV stores only text, so each message is re-read from Slack first to
+    recover its attachments — image/file-only messages (blank text) are replayed
+    too, with the image carrying any text as its caption, exactly as the realtime
+    path forwards them. If a message can no longer be re-read from Slack, we fall
+    back to replaying the text the CSV preserved.
     """
     if not REALTIME_CSV.exists():
         print(f"No realtime ledger at {REALTIME_CSV}; nothing to replay.")
@@ -760,21 +790,23 @@ def replay_failed_realtime() -> None:
     # prior replay — is considered delivered and skipped.
     sent_keys = _csv_sent_keys(REALTIME_CSV)
     pending: dict = {}  # key -> row, de-duped (a key may have several failed rows)
-    skipped_empty = 0
+    skipped_no_id = 0
     with REALTIME_CSV.open("r", encoding="utf-8", newline="") as f:
         for row in csv.DictReader(f):
             if row.get("status") != "failed":
                 continue
-            key = f"{row.get('slack_channel', '')}:{row.get('slack_ts', '')}"
+            channel = row.get("slack_channel", "")
+            ts = row.get("slack_ts", "")
+            key = f"{channel}:{ts}"
             if key in sent_keys:
                 continue  # delivered on a later attempt
-            if not (row.get("text") or "").strip():
-                skipped_empty += 1  # attachment-only message; nothing to replay from CSV
+            if not channel or not ts:
+                skipped_no_id += 1  # no channel/ts: can't re-read or relay it
                 continue
             pending[key] = row  # keep the latest failed row for this key
 
-    if skipped_empty:
-        print(f"Skipping {skipped_empty} failed row(s) with no text (attachment-only).")
+    if skipped_no_id:
+        print(f"Skipping {skipped_no_id} failed row(s) missing a channel/ts.")
 
     total = len(pending)
     if not total:
@@ -787,11 +819,37 @@ def replay_failed_realtime() -> None:
     )
     sent = 0
     failed = 0
+    skipped = 0
     for i, (key, row) in enumerate(pending.items(), 1):
-        text = row.get("text") or ""
+        channel = row.get("slack_channel", "")
+        ts = row.get("slack_ts", "")
+
+        # Re-read the message so attachments (which the CSV never stored) ride
+        # along; fall back to the CSV text if Slack can no longer return it.
+        msg = _fetch_slack_message(channel, ts)
+        if msg is not None:
+            text = msg.get("text") or row.get("text") or ""
+            files = msg.get("files")
+        else:
+            text = row.get("text") or ""
+            files = None
+
+        if not (text or "").strip() and not files:
+            print(f"  [{i}/{total}] {key}: nothing to replay (no text or attachments)")
+            skipped += 1
+            continue
+
+        def _on_file_error(file_obj, exc, _key=key):
+            ident = file_obj.get("name") or file_obj.get("id") if file_obj else _key
+            print(f"  {_key}: failed to relay attachment {ident}: {exc}")
+
         try:
-            send_slack_text(text, message_thread_id=TELEGRAM_LIVE_THREAD_ID)
-            ok = True
+            ok = relay_slack_message(
+                text,
+                files,
+                message_thread_id=TELEGRAM_LIVE_THREAD_ID,
+                on_file_error=_on_file_error,
+            )
         except Exception as exc:
             print(f"  [{i}/{total}] {key}: still failing: {exc}")
             ok = False
@@ -799,8 +857,8 @@ def replay_failed_realtime() -> None:
         _log_csv_row(
             REALTIME_CSV,
             source="replay",
-            channel=row.get("slack_channel", ""),
-            ts=row.get("slack_ts", ""),
+            channel=channel,
+            ts=ts,
             user=row.get("slack_user", ""),
             thread_id=TELEGRAM_LIVE_THREAD_ID,
             status="sent" if ok else "failed",
@@ -819,6 +877,7 @@ def replay_failed_realtime() -> None:
     print(
         f"Replay complete. Re-sent {sent}"
         + (f", {failed} still failing" if failed else "")
+        + (f", {skipped} skipped" if skipped else "")
         + "."
     )
 
