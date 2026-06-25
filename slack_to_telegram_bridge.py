@@ -42,6 +42,12 @@ BACKFILL_SLACK_PAGE_SIZE = max(
     1, min(50, int(os.environ.get("BACKFILL_SLACK_PAGE_SIZE", "40")))
 )
 
+# Minimum seconds between Slack read calls (conversations.history / .replies). Slack apps
+# created after May 2025 that aren't Marketplace-approved are throttled to ~1 request/minute
+# on these methods, so we pace proactively to avoid burning the whole run waiting out 429s.
+# Lower this (e.g. "1.2" for the legacy ~50/min Tier 3) if your app has the older limits.
+SLACK_READ_INTERVAL_SECONDS = float(os.environ.get("SLACK_READ_INTERVAL_SECONDS", "60"))
+
 # Tracks which (channel, message-ts) pairs the backfill has already relayed, so re-runs skip them.
 # Delete this file to force a full re-send.
 BACKFILL_STATE_FILE = Path(
@@ -425,16 +431,39 @@ def handle_message_events(event, say, logger):
         _realtime_sent_keys.add(key)
 
 
+# Wall-clock of the last Slack read call, so _slack_call can space calls out proactively.
+_last_slack_read = 0.0
+# Running count of read calls this process has made (drives the read-phase heartbeat).
+_slack_read_count = 0
+
+
 def _slack_call(method, **kwargs):
-    """Call a Slack Web API method, transparently waiting out HTTP 429 rate limits."""
+    """Call a Slack Web API method, pacing proactively and waiting out HTTP 429 rate limits."""
+    global _last_slack_read, _slack_read_count
     while True:
+        # Stay under the per-method rate limit instead of repeatedly slamming into 429s.
+        wait = SLACK_READ_INTERVAL_SECONDS - (time.monotonic() - _last_slack_read)
+        if wait > 0:
+            # When pacing is slow (the post-May-2025 ~1/min tier), the read phase is
+            # otherwise silent for minutes — emit a heartbeat so it's clearly alive.
+            if SLACK_READ_INTERVAL_SECONDS >= 5:
+                print(
+                    f"  [slack read #{_slack_read_count + 1}] waiting {wait:.0f}s for "
+                    f"rate limit ({_format_duration(SLACK_READ_INTERVAL_SECONDS)}/call)",
+                    flush=True,
+                )
+            time.sleep(wait)
         try:
-            return method(**kwargs)
+            resp = method(**kwargs)
+            _last_slack_read = time.monotonic()
+            _slack_read_count += 1
+            return resp
         except SlackApiError as exc:
             if exc.response is not None and exc.response.status_code == 429:
                 retry_after = int(exc.response.headers.get("Retry-After", "5"))
                 print(f"Slack rate limited; sleeping {retry_after}s")
                 time.sleep(retry_after)
+                _last_slack_read = time.monotonic()
                 continue
             raise
 
@@ -454,6 +483,21 @@ def _record_sent_key(key: str) -> None:
     """Append a relayed key to the state file (append-only so a crash can't corrupt it)."""
     with BACKFILL_STATE_FILE.open("a", encoding="utf-8") as f:
         f.write(key + "\n")
+
+
+def _ensure_csv(path: Path) -> None:
+    """Create the CSV ledger with its header row if it doesn't exist yet.
+
+    Lets the file exist from first launch (rather than appearing only once the first
+    message is relayed); subsequent rows are appended by ``_log_csv_row``.
+    """
+    if path.exists():
+        return
+    try:
+        with path.open("w", encoding="utf-8", newline="") as f:
+            csv.DictWriter(f, fieldnames=CSV_FIELDS).writeheader()
+    except OSError as exc:
+        print(f"Failed to create CSV ledger {path}: {exc}")
 
 
 def _log_csv_row(
@@ -579,6 +623,27 @@ def _relay_history_message(channel: str, msg: dict) -> bool:
     )
 
 
+def _format_duration(seconds: float) -> str:
+    """Render a duration as a compact human string, e.g. ``2h05m`` / ``3m12s`` / ``45s``."""
+    seconds = int(max(0, seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
+def _progress_bar(done: int, total: int, width: int = 24) -> str:
+    """Render a textual progress bar like ``[######----] 18/40 (45%)``."""
+    if total <= 0:
+        return f"[{'-' * width}] 0/0 (100%)"
+    frac = min(1.0, done / total)
+    filled = int(frac * width)
+    return f"[{'#' * filled}{'-' * (width - filled)}] {done}/{total} ({frac * 100:.0f}%)"
+
+
 def backfill_channel(channel: str) -> None:
     print(f"Backfilling all history from {TARGET_SLACK_USER_ID} in {channel}...")
     if TELEGRAM_HISTORY_THREAD_ID is None:
@@ -587,12 +652,22 @@ def backfill_channel(channel: str) -> None:
             "General topic and mix with live forwards."
         )
 
+    # Make sure both ledgers exist up front, then dedup against what's already recorded.
+    _ensure_csv(BACKFILL_CSV)
+    _ensure_csv(REALTIME_CSV)
+
     # Union the legacy state file with the CSV ledger so an existing deployment
     # (state file present, CSV not yet) never re-sends already-relayed history.
     sent_keys = _load_sent_keys() | _csv_sent_keys(BACKFILL_CSV)
 
+    # --- Phase 1: scan channel history (and threads) for the target user's messages.
+    # We can't know the page count up front (Slack paginates blindly), so this phase
+    # reports a heartbeat per read call rather than a percentage bar.
+    print("Phase 1/2: scanning Slack history (read calls are rate-limited)...")
+    read_start = time.monotonic()
     collected: dict = {}
     cursor = None
+    page = 0
     while True:
         resp = _slack_call(
             app.client.conversations_history,
@@ -600,23 +675,37 @@ def backfill_channel(channel: str) -> None:
             limit=BACKFILL_SLACK_PAGE_SIZE,
             cursor=cursor,
         )
+        page += 1
         for msg in resp.get("messages", []):
             _collect_target_messages(channel, msg, collected)
+        print(
+            f"  history page {page}: {len(collected)} target message(s) so far "
+            f"({_slack_read_count} read call(s), elapsed "
+            f"{_format_duration(time.monotonic() - read_start)})",
+            flush=True,
+        )
         cursor = (resp.get("response_metadata") or {}).get("next_cursor")
         if not cursor:
             break
 
     ordered = sorted(collected.values(), key=lambda m: float(m.get("ts", "0")))
-    print(f"Found {len(ordered)} message(s) from the target user (oldest first).")
+    pending = [m for m in ordered if f"{channel}:{m.get('ts', '')}" not in sent_keys]
+    already = len(ordered) - len(pending)
+    total = len(pending)
+    print(
+        f"Found {len(ordered)} message(s) from the target user "
+        f"({already} already relayed, {total} to send)."
+    )
 
+    # --- Phase 2: relay the pending messages to Telegram. Here we know the total,
+    # so we render a real progress bar with an ETA derived from the measured rate.
+    print(f"Phase 2/2: relaying {total} message(s) to Telegram...")
     sent = 0
-    skipped = 0
-    for msg in ordered:
+    failed = 0
+    send_start = time.monotonic()
+    for i, msg in enumerate(pending, 1):
         ts = msg.get("ts", "")
         key = f"{channel}:{ts}"
-        if key in sent_keys:
-            skipped += 1
-            continue
         ok = _relay_history_message(channel, msg)
         _log_csv_row(
             BACKFILL_CSV,
@@ -632,11 +721,24 @@ def backfill_channel(channel: str) -> None:
             _record_sent_key(key)
             sent_keys.add(key)
             sent += 1
-            if sent % 25 == 0:
-                print(f"  relayed {sent} (skipped {skipped} already-sent)")
+        else:
+            failed += 1
+
+        elapsed = time.monotonic() - send_start
+        eta = (elapsed / i) * (total - i)
+        print(
+            f"  {_progress_bar(i, total)} · ETA {_format_duration(eta)}"
+            + (f" · {failed} failed" if failed else ""),
+            flush=True,
+        )
+        if ok and i < total:
             time.sleep(BACKFILL_SEND_DELAY_SECONDS)
 
-    print(f"Backfill complete. Sent {sent}, skipped {skipped} already-sent.")
+    print(
+        f"Backfill complete. Sent {sent}, skipped {already} already-sent"
+        + (f", {failed} failed" if failed else "")
+        + "."
+    )
 
 
 if __name__ == "__main__":
@@ -647,6 +749,8 @@ if __name__ == "__main__":
         backfill_channel(sys.argv[2])
     else:
         logging.basicConfig(level=logging.INFO)
+        _ensure_csv(REALTIME_CSV)
+        _ensure_csv(BACKFILL_CSV)
         _realtime_sent_keys = _csv_sent_keys(REALTIME_CSV)
         print("Starting Slack to Telegram bridge...")
         print(f"  TARGET_SLACK_USER_ID   = {TARGET_SLACK_USER_ID}")
