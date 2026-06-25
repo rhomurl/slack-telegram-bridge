@@ -1,4 +1,5 @@
 import html
+import logging
 import os
 import re
 import sys
@@ -219,12 +220,28 @@ def download_slack_file(file_obj: dict) -> Path | None:
 
 @app.event("message")
 def handle_message_events(event, say, logger):
+    logger.info(
+        "Slack message event: user=%s subtype=%s channel=%s ts=%s",
+        event.get("user"),
+        event.get("subtype"),
+        event.get("channel"),
+        event.get("ts"),
+    )
+
     if event.get("subtype") in IGNORED_SUBTYPES:
+        logger.info("  -> ignored subtype %s", event.get("subtype"))
         return
 
     user_id = event.get("user")
     if user_id != TARGET_SLACK_USER_ID:
+        logger.info(
+            "  -> skipping: user %s != TARGET_SLACK_USER_ID %s",
+            user_id,
+            TARGET_SLACK_USER_ID,
+        )
         return
+
+    logger.info("  -> forwarding to Telegram thread %s", TELEGRAM_LIVE_THREAD_ID)
 
     text = event.get("text", "")
 
@@ -430,5 +447,9 @@ if __name__ == "__main__":
             sys.exit(1)
         backfill_channel(sys.argv[2])
     else:
+        logging.basicConfig(level=logging.INFO)
         print("Starting Slack to Telegram bridge...")
+        print(f"  TARGET_SLACK_USER_ID   = {TARGET_SLACK_USER_ID}")
+        print(f"  TELEGRAM_CHAT_ID       = {TELEGRAM_CHAT_ID}")
+        print(f"  TELEGRAM_LIVE_THREAD_ID = {TELEGRAM_LIVE_THREAD_ID}")
         SocketModeHandler(app, SLACK_APP_TOKEN).start()
