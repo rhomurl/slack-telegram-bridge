@@ -29,6 +29,7 @@ Telegram group
 - Slack image attachments via Telegram `sendPhoto`
 - Other Slack file attachments (PDF, etc.) via Telegram `sendDocument`
 - Optional one-time history backfill of the target user's past messages into a separate Telegram topic, sent silently so subscribers aren't notified
+- A CSV ledger of every relayed message (live and backfill, in separate files), recording the Telegram chat + thread/topic and a `sent`/`failed` status — used both as an audit log and to skip messages already sent
 
 ---
 
@@ -265,6 +266,10 @@ TELEGRAM_LIVE_THREAD_ID=
 
 # Optional: separate forum topic for the historical backfill.
 TELEGRAM_HISTORY_THREAD_ID=
+
+# Optional: override the CSV ledger paths (defaults shown).
+# BACKFILL_CSV=backfill_messages.csv
+# REALTIME_CSV=realtime_messages.csv
 ```
 
 Do not commit this file to GitHub. See `.env.example` for the full list of variables.
@@ -295,7 +300,34 @@ python slack_to_telegram_bridge.py backfill <channel_id>
 
 - They are sent with notifications disabled so existing subscribers are not pinged.
 - Set `TELEGRAM_HISTORY_THREAD_ID` to post the backfill into its own forum topic, keeping it separate from live forwards.
-- Already-relayed messages are tracked in a state file (`.backfill_state`), so re-running the command skips them. Delete that file to force a full re-send.
+- Already-relayed messages are tracked in a state file (`.backfill_state`) **and** in `backfill_messages.csv` (see below). Re-running the command skips any message recorded as sent in either. Delete both to force a full re-send.
+
+---
+
+## CSV ledgers
+
+Every relayed message is appended to a CSV, one row per Slack message. Live forwards and backfill use **separate** files so the two flows stay independent:
+
+| File | Written by |
+| --- | --- |
+| `realtime_messages.csv` | the live forwarder (no arguments) |
+| `backfill_messages.csv` | the `backfill` subcommand |
+
+Columns:
+
+```text
+logged_at, source, slack_channel, slack_ts, slack_user,
+telegram_chat_id, telegram_thread_id, status, text
+```
+
+- `telegram_thread_id` is the exact forum topic the message was sent to (blank for the General topic), so you can filter a CSV to validate what already landed in a given thread/topic.
+- `status` is `sent` on success or `failed` if the Telegram send raised. Only `sent` rows count toward de-duplication; `failed` rows are retried on the next run.
+- These files are used as the "already sent" record:
+  - **Realtime** seeds an in-memory set from `realtime_messages.csv` at startup and skips any `channel:ts` already sent — so socket-mode redeliveries don't double-post.
+  - **Backfill** unions `backfill_messages.csv` with the legacy `.backfill_state` file before sending.
+- Both files are git-ignored (per-deployment data) and override-able via `BACKFILL_CSV` / `REALTIME_CSV`.
+
+> De-dup keys on `channel:ts`, not the thread id, so re-pointing forwarding at a different topic will **not** re-send old messages there. The thread id is still recorded per row for inspection.
 
 ---
 

@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 .pm2/
 .backfill_state
+backfill_messages.csv
+realtime_messages.csv
