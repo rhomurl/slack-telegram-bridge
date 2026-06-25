@@ -36,6 +36,12 @@ TELEGRAM_HISTORY_THREAD_ID = int(_history_thread_raw) if _history_thread_raw els
 # Telegram throttles group sends to roughly 20 messages/minute; pace the backfill to stay under it.
 BACKFILL_SEND_DELAY_SECONDS = float(os.environ.get("BACKFILL_SEND_DELAY_SECONDS", "3"))
 
+# How many messages to pull per Slack history/replies read during backfill. Keep this
+# small (30-50) so each call is lighter and we trip Slack's rate limits less often.
+BACKFILL_SLACK_PAGE_SIZE = max(
+    1, min(50, int(os.environ.get("BACKFILL_SLACK_PAGE_SIZE", "40")))
+)
+
 # Minimum seconds between Slack read calls (conversations.history / .replies). Slack apps
 # created after May 2025 that aren't Marketplace-approved are throttled to ~1 request/minute
 # on these methods, so we pace proactively to avoid burning the whole run waiting out 429s.
@@ -564,7 +570,7 @@ def _collect_target_messages(channel: str, msg: dict, collected: dict) -> None:
             app.client.conversations_replies,
             channel=channel,
             ts=thread_ts,
-            limit=200,
+            limit=BACKFILL_SLACK_PAGE_SIZE,
             cursor=cursor,
         )
         for reply in resp.get("messages", []):
@@ -666,7 +672,7 @@ def backfill_channel(channel: str) -> None:
         resp = _slack_call(
             app.client.conversations_history,
             channel=channel,
-            limit=200,
+            limit=BACKFILL_SLACK_PAGE_SIZE,
             cursor=cursor,
         )
         page += 1
