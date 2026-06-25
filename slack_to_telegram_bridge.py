@@ -741,12 +741,96 @@ def backfill_channel(channel: str) -> None:
     )
 
 
+def replay_failed_realtime() -> None:
+    """Re-send realtime messages previously logged as ``failed`` to the live thread.
+
+    Reads ``REALTIME_CSV``, finds rows marked ``failed`` whose ``channel:ts`` was
+    never later recorded as ``sent``, and re-posts each one's text to the live
+    Telegram thread. Each successful resend is appended to the ledger as a new
+    ``sent`` row (the ledger is append-only), so the next run skips it.
+
+    Only the message text is replayed — the CSV does not store attachments, so
+    image/file-only messages (blank text) can't be reconstructed and are skipped.
+    """
+    if not REALTIME_CSV.exists():
+        print(f"No realtime ledger at {REALTIME_CSV}; nothing to replay.")
+        return
+
+    # Any (channel:ts) already recorded as sent — on the original attempt or a
+    # prior replay — is considered delivered and skipped.
+    sent_keys = _csv_sent_keys(REALTIME_CSV)
+    pending: dict = {}  # key -> row, de-duped (a key may have several failed rows)
+    skipped_empty = 0
+    with REALTIME_CSV.open("r", encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            if row.get("status") != "failed":
+                continue
+            key = f"{row.get('slack_channel', '')}:{row.get('slack_ts', '')}"
+            if key in sent_keys:
+                continue  # delivered on a later attempt
+            if not (row.get("text") or "").strip():
+                skipped_empty += 1  # attachment-only message; nothing to replay from CSV
+                continue
+            pending[key] = row  # keep the latest failed row for this key
+
+    if skipped_empty:
+        print(f"Skipping {skipped_empty} failed row(s) with no text (attachment-only).")
+
+    total = len(pending)
+    if not total:
+        print("No failed realtime messages to replay.")
+        return
+
+    print(
+        f"Replaying {total} failed realtime message(s) to Telegram thread "
+        f"{TELEGRAM_LIVE_THREAD_ID}..."
+    )
+    sent = 0
+    failed = 0
+    for i, (key, row) in enumerate(pending.items(), 1):
+        text = row.get("text") or ""
+        try:
+            send_slack_text(text, message_thread_id=TELEGRAM_LIVE_THREAD_ID)
+            ok = True
+        except Exception as exc:
+            print(f"  [{i}/{total}] {key}: still failing: {exc}")
+            ok = False
+
+        _log_csv_row(
+            REALTIME_CSV,
+            source="replay",
+            channel=row.get("slack_channel", ""),
+            ts=row.get("slack_ts", ""),
+            user=row.get("slack_user", ""),
+            thread_id=TELEGRAM_LIVE_THREAD_ID,
+            status="sent" if ok else "failed",
+            text=text,
+        )
+        if ok:
+            _realtime_sent_keys.add(key)
+            sent += 1
+            print(f"  [{i}/{total}] {key}: re-sent")
+        else:
+            failed += 1
+
+        if i < total:
+            time.sleep(BACKFILL_SEND_DELAY_SECONDS)
+
+    print(
+        f"Replay complete. Re-sent {sent}"
+        + (f", {failed} still failing" if failed else "")
+        + "."
+    )
+
+
 if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1] == "backfill":
         if len(sys.argv) < 3:
             print("Usage: python slack_to_telegram_bridge.py backfill <channel_id>")
             sys.exit(1)
         backfill_channel(sys.argv[2])
+    elif len(sys.argv) >= 2 and sys.argv[1] == "replay-failed":
+        replay_failed_realtime()
     else:
         logging.basicConfig(level=logging.INFO)
         _ensure_csv(REALTIME_CSV)
