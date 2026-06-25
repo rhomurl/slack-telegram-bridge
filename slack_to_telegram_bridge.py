@@ -1,3 +1,4 @@
+import csv
 import html
 import logging
 import os
@@ -40,6 +41,32 @@ BACKFILL_SEND_DELAY_SECONDS = float(os.environ.get("BACKFILL_SEND_DELAY_SECONDS"
 BACKFILL_STATE_FILE = Path(
     os.environ.get("BACKFILL_STATE_FILE", Path(__file__).resolve().parent / ".backfill_state")
 )
+
+# Human-readable CSV ledgers of every message we relay. One row per Slack message,
+# recording the Telegram chat + thread/topic it was sent to and a sent/failed status.
+# These double as the "already sent" record used for de-duplication.
+BACKFILL_CSV = Path(
+    os.environ.get("BACKFILL_CSV", Path(__file__).resolve().parent / "backfill_messages.csv")
+)
+REALTIME_CSV = Path(
+    os.environ.get("REALTIME_CSV", Path(__file__).resolve().parent / "realtime_messages.csv")
+)
+
+CSV_FIELDS = [
+    "logged_at",
+    "source",
+    "slack_channel",
+    "slack_ts",
+    "slack_user",
+    "telegram_chat_id",
+    "telegram_thread_id",
+    "status",
+    "text",
+]
+
+# Realtime de-dup set, seeded from REALTIME_CSV at startup (see __main__) and grown
+# in-memory as messages are forwarded, so socket-mode redeliveries don't double-post.
+_realtime_sent_keys: set = set()
 
 # Backfilled messages are timestamped in US Eastern Time (handles EST/EDT automatically).
 EASTERN = ZoneInfo("America/New_York")
@@ -343,6 +370,13 @@ def handle_message_events(event, say, logger):
         )
         return
 
+    channel = event.get("channel", "")
+    ts = event.get("ts", "")
+    key = f"{channel}:{ts}"
+    if key in _realtime_sent_keys:
+        logger.info("  -> skipping: already forwarded (key %s)", key)
+        return
+
     logger.info("  -> forwarding to Telegram thread %s", TELEGRAM_LIVE_THREAD_ID)
 
     text = event.get("text", "")
@@ -360,12 +394,29 @@ def handle_message_events(event, say, logger):
 
     # Forward only the message itself — no Slack header, no permalink line.
     # An image carries the text as its caption (one combined Telegram message).
-    relay_slack_message(
-        text,
-        event.get("files"),
-        message_thread_id=TELEGRAM_LIVE_THREAD_ID,
-        on_file_error=_on_file_error,
+    try:
+        sent = relay_slack_message(
+            text,
+            event.get("files"),
+            message_thread_id=TELEGRAM_LIVE_THREAD_ID,
+            on_file_error=_on_file_error,
+        )
+    except Exception as exc:
+        logger.exception("Failed to forward Slack message %s: %s", ts, exc)
+        sent = False
+
+    _log_csv_row(
+        REALTIME_CSV,
+        source="realtime",
+        channel=channel,
+        ts=ts,
+        user=user_id,
+        thread_id=TELEGRAM_LIVE_THREAD_ID,
+        status="sent" if sent else "failed",
+        text=text,
     )
+    if sent:
+        _realtime_sent_keys.add(key)
 
 
 def _slack_call(method, **kwargs):
@@ -397,6 +448,54 @@ def _record_sent_key(key: str) -> None:
     """Append a relayed key to the state file (append-only so a crash can't corrupt it)."""
     with BACKFILL_STATE_FILE.open("a", encoding="utf-8") as f:
         f.write(key + "\n")
+
+
+def _log_csv_row(
+    path: Path,
+    *,
+    source: str,
+    channel: str,
+    ts: str,
+    user: str,
+    thread_id: int | None,
+    status: str,
+    text: str,
+) -> None:
+    """Append one message row to a CSV ledger, writing the header if the file is new."""
+    is_new = not path.exists()
+    try:
+        with path.open("a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
+            if is_new:
+                writer.writeheader()
+            writer.writerow(
+                {
+                    "logged_at": datetime.now(tz=EASTERN).isoformat(timespec="seconds"),
+                    "source": source,
+                    "slack_channel": channel,
+                    "slack_ts": ts,
+                    "slack_user": user,
+                    "telegram_chat_id": TELEGRAM_CHAT_ID,
+                    "telegram_thread_id": "" if thread_id is None else thread_id,
+                    "status": status,
+                    "text": text,
+                }
+            )
+    except OSError as exc:
+        # Logging must never break forwarding; surface it but keep going.
+        print(f"Failed to write CSV row to {path}: {exc}")
+
+
+def _csv_sent_keys(path: Path) -> set:
+    """Return the set of ``channel:ts`` keys already recorded as sent in a CSV ledger."""
+    if not path.exists():
+        return set()
+    keys = set()
+    with path.open("r", encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            if row.get("status") == "sent":
+                keys.add(f"{row.get('slack_channel', '')}:{row.get('slack_ts', '')}")
+    return keys
 
 
 def _collect_target_messages(channel: str, msg: dict, collected: dict) -> None:
@@ -482,7 +581,9 @@ def backfill_channel(channel: str) -> None:
             "General topic and mix with live forwards."
         )
 
-    sent_keys = _load_sent_keys()
+    # Union the legacy state file with the CSV ledger so an existing deployment
+    # (state file present, CSV not yet) never re-sends already-relayed history.
+    sent_keys = _load_sent_keys() | _csv_sent_keys(BACKFILL_CSV)
 
     collected: dict = {}
     cursor = None
@@ -505,11 +606,23 @@ def backfill_channel(channel: str) -> None:
     sent = 0
     skipped = 0
     for msg in ordered:
-        key = f"{channel}:{msg.get('ts', '')}"
+        ts = msg.get("ts", "")
+        key = f"{channel}:{ts}"
         if key in sent_keys:
             skipped += 1
             continue
-        if _relay_history_message(channel, msg):
+        ok = _relay_history_message(channel, msg)
+        _log_csv_row(
+            BACKFILL_CSV,
+            source="backfill",
+            channel=channel,
+            ts=ts,
+            user=msg.get("user", ""),
+            thread_id=TELEGRAM_HISTORY_THREAD_ID,
+            status="sent" if ok else "failed",
+            text=msg.get("text") or "",
+        )
+        if ok:
             _record_sent_key(key)
             sent_keys.add(key)
             sent += 1
@@ -528,8 +641,10 @@ if __name__ == "__main__":
         backfill_channel(sys.argv[2])
     else:
         logging.basicConfig(level=logging.INFO)
+        _realtime_sent_keys = _csv_sent_keys(REALTIME_CSV)
         print("Starting Slack to Telegram bridge...")
         print(f"  TARGET_SLACK_USER_ID   = {TARGET_SLACK_USER_ID}")
         print(f"  TELEGRAM_CHAT_ID       = {TELEGRAM_CHAT_ID}")
         print(f"  TELEGRAM_LIVE_THREAD_ID = {TELEGRAM_LIVE_THREAD_ID}")
+        print(f"  REALTIME_CSV           = {REALTIME_CSV} ({len(_realtime_sent_keys)} already sent)")
         SocketModeHandler(app, SLACK_APP_TOKEN).start()
