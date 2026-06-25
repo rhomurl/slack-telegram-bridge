@@ -1,5 +1,7 @@
+import html
 import logging
 import os
+import re
 import sys
 import tempfile
 import time
@@ -54,16 +56,79 @@ IGNORED_SUBTYPES = {
 app = App(token=SLACK_BOT_TOKEN)
 
 
+# --- Slack mrkdwn -> Telegram HTML ------------------------------------------
+# Slack already HTML-escapes literal &, <, > as entities and wraps links/mentions
+# in real angle brackets, so we can parse those tokens out and keep the entities
+# (Telegram's HTML parse mode expects exactly &amp;/&lt;/&gt;).
+_RE_USER = re.compile(r"<@([A-Z0-9]+)(?:\|([^>]+))?>")
+_RE_CHANNEL = re.compile(r"<#[A-Z0-9]+(?:\|([^>]+))?>")
+_RE_SPECIAL = re.compile(r"<!(\w+)(?:\|([^>]+))?>")
+_RE_LINK = re.compile(r"<((?:https?|mailto|tel):[^|>]+)\|([^>]+)>")
+_RE_BARE_LINK = re.compile(r"<((?:https?|mailto|tel):[^|>]+)>")
+
+
+def _format_inline(text: str) -> str:
+    """Convert Slack's *bold* / _italic_ / ~strike~ markers to HTML tags."""
+    text = re.sub(r"(?<![*\w])\*(?=\S)(.+?)(?<=\S)\*(?![*\w])", r"<b>\1</b>", text)
+    text = re.sub(r"(?<![_\w])_(?=\S)(.+?)(?<=\S)_(?![_\w])", r"<i>\1</i>", text)
+    text = re.sub(r"(?<![~\w])~(?=\S)(.+?)(?<=\S)~(?![~\w])", r"<s>\1</s>", text)
+    return text
+
+
+def convert_mrkdwn_to_html(text: str) -> str:
+    """Render Slack mrkdwn as Telegram-flavoured HTML (parse_mode=HTML)."""
+    if not text:
+        return text
+
+    # Stash fragments that must not be touched by the inline formatter
+    # (code, links, mentions — any of which may legitimately contain * _ ~).
+    stash: list[str] = []
+
+    def _stash(fragment: str) -> str:
+        stash.append(fragment)
+        return f"\x00{len(stash) - 1}\x00"
+
+    text = re.sub(r"```(.*?)```", lambda m: _stash(f"<pre>{m.group(1)}</pre>"), text, flags=re.DOTALL)
+    text = re.sub(r"`([^`\n]+)`", lambda m: _stash(f"<code>{m.group(1)}</code>"), text)
+
+    text = _RE_USER.sub(lambda m: _stash("@" + (m.group(2) or m.group(1))), text)
+    text = _RE_CHANNEL.sub(lambda m: _stash("#" + (m.group(1) or "channel")), text)
+    text = _RE_SPECIAL.sub(lambda m: _stash("@" + (m.group(2) or m.group(1))), text)
+    text = _RE_LINK.sub(lambda m: _stash(f'<a href="{m.group(1)}">{m.group(2)}</a>'), text)
+    text = _RE_BARE_LINK.sub(lambda m: _stash(f'<a href="{m.group(1)}">{m.group(1)}</a>'), text)
+
+    text = _format_inline(text)
+
+    for i, fragment in enumerate(stash):
+        text = text.replace(f"\x00{i}\x00", fragment)
+    return text
+
+
+def _html_to_plain(html_text: str) -> str:
+    """Strip the HTML we emit back to readable plain text (used as a send fallback)."""
+    text = re.sub(r'<a href="([^"]+)">(.*?)</a>', r"\2 (\1)", html_text, flags=re.DOTALL)
+    text = re.sub(r"</?(?:b|i|s|code|pre)>", "", text)
+    return html.unescape(text)
+
+
 def tg_api(method: str) -> str:
     return f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
 
 
-def send_telegram_message(text: str, message_thread_id: int | None = None) -> None:
+def send_telegram_message(
+    text: str,
+    message_thread_id: int | None = None,
+    parse_mode: str | None = None,
+    disable_notification: bool = False,
+) -> None:
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text[:4096],
         "disable_web_page_preview": False,
+        "disable_notification": disable_notification,
     }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     if message_thread_id is not None:
         payload["message_thread_id"] = message_thread_id
     response = requests.post(
@@ -74,17 +139,53 @@ def send_telegram_message(text: str, message_thread_id: int | None = None) -> No
     response.raise_for_status()
 
 
+def send_slack_text(
+    raw_text: str,
+    suffix: str = "",
+    message_thread_id: int | None = None,
+    disable_notification: bool = False,
+) -> None:
+    """Forward Slack-authored text, rendering its mrkdwn as Telegram HTML.
+
+    ``suffix`` is appended verbatim (already-formatted, e.g. a timestamp line).
+    If Telegram rejects the HTML (malformed tags), retry once as plain text.
+    """
+    body_html = convert_mrkdwn_to_html(raw_text.strip()) or "[no text]"
+    html_text = f"{body_html}{suffix}"
+    try:
+        send_telegram_message(
+            html_text,
+            message_thread_id=message_thread_id,
+            parse_mode="HTML",
+            disable_notification=disable_notification,
+        )
+    except requests.HTTPError as exc:
+        if exc.response is None or exc.response.status_code != 400:
+            raise
+        plain_text = f"{_html_to_plain(body_html)}{suffix}"
+        send_telegram_message(
+            plain_text,
+            message_thread_id=message_thread_id,
+            disable_notification=disable_notification,
+        )
+
+
 def send_telegram_file(
     path: Path,
     caption: str,
     mime_type: str | None = None,
     message_thread_id: int | None = None,
+    disable_notification: bool = False,
 ) -> None:
     is_image = bool(mime_type and mime_type.startswith("image/"))
     method = "sendPhoto" if is_image else "sendDocument"
     field = "photo" if is_image else "document"
 
-    data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1024]}
+    data = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "caption": caption[:1024],
+        "disable_notification": disable_notification,
+    }
     if message_thread_id is not None:
         data["message_thread_id"] = message_thread_id
 
@@ -142,23 +243,10 @@ def handle_message_events(event, say, logger):
 
     logger.info("  -> forwarding to Telegram thread %s", TELEGRAM_LIVE_THREAD_ID)
 
-    channel = event.get("channel", "unknown-channel")
     text = event.get("text", "")
-    ts = event.get("ts", "")
-    permalink = None
 
-    try:
-        permalink_result = app.client.chat_getPermalink(channel=channel, message_ts=ts)
-        permalink = permalink_result.get("permalink")
-    except Exception as exc:
-        logger.warning(f"Could not get permalink: {exc}")
-
-    header = f"Slack message from <@{user_id}> in {channel}"
-    body = text.strip() or "[no text]"
-    if permalink:
-        body += f"\n\nSlack link: {permalink}"
-
-    send_telegram_message(f"{header}\n\n{body}", message_thread_id=TELEGRAM_LIVE_THREAD_ID)
+    # Forward only the message itself — no Slack header, no permalink line.
+    send_slack_text(text, message_thread_id=TELEGRAM_LIVE_THREAD_ID)
 
     for file_obj in event.get("files", []) or []:
         try:
@@ -166,15 +254,11 @@ def handle_message_events(event, say, logger):
             if not path:
                 continue
 
-            caption_parts = [f"Attachment from <@{user_id}>"]
-            if file_obj.get("title"):
-                caption_parts.append(str(file_obj["title"]))
-            if permalink:
-                caption_parts.append(permalink)
-
+            # Any non-image (PDF, etc.) is relayed as a document; images as photos.
+            caption = str(file_obj.get("title") or "")
             send_telegram_file(
                 path=path,
-                caption="\n".join(caption_parts),
+                caption=caption,
                 mime_type=file_obj.get("mimetype"),
                 message_thread_id=TELEGRAM_LIVE_THREAD_ID,
             )
@@ -264,9 +348,8 @@ def _relay_history_message(channel: str, msg: dict) -> bool:
     Returns True if the text message was sent (so the caller can mark it relayed),
     False if it failed and should be retried on the next run.
     """
-    user_id = msg.get("user")
     ts = msg.get("ts", "")
-    text = (msg.get("text") or "").strip() or "[no text]"
+    text = msg.get("text") or ""
 
     when = ""
     if ts:
@@ -275,23 +358,17 @@ def _relay_history_message(channel: str, msg: dict) -> bool:
         except (ValueError, OverflowError):
             when = ""
 
-    permalink = None
-    try:
-        permalink_result = app.client.chat_getPermalink(channel=channel, message_ts=ts)
-        permalink = permalink_result.get("permalink")
-    except Exception as exc:
-        print(f"Could not get permalink for {ts}: {exc}")
-
-    # Lead with the timestamp so the topic reads as a scannable chronological log.
-    header = f"[History] {when} — from <@{user_id}> in {channel}" if when else (
-        f"[History] from <@{user_id}> in {channel}"
-    )
-    body = text
-    if permalink:
-        body += f"\n\nSlack link: {permalink}"
+    # Format: the message, then a blank line, then the timestamp. Backfill posts
+    # silently (disable_notification) so subscribers aren't pinged for old messages.
+    suffix = f"\n\n{when}" if when else ""
 
     try:
-        send_telegram_message(f"{header}\n\n{body}", message_thread_id=TELEGRAM_HISTORY_THREAD_ID)
+        send_slack_text(
+            text,
+            suffix=suffix,
+            message_thread_id=TELEGRAM_HISTORY_THREAD_ID,
+            disable_notification=True,
+        )
     except Exception as exc:
         print(f"Failed to send message {ts} to Telegram: {exc}")
         return False
@@ -302,17 +379,13 @@ def _relay_history_message(channel: str, msg: dict) -> bool:
             if not path:
                 continue
 
-            caption_parts = [f"[History] Attachment from <@{user_id}>"]
-            if file_obj.get("title"):
-                caption_parts.append(str(file_obj["title"]))
-            if permalink:
-                caption_parts.append(permalink)
-
+            # Images go as photos, everything else (PDF, etc.) as a document.
             send_telegram_file(
                 path=path,
-                caption="\n".join(caption_parts),
+                caption=str(file_obj.get("title") or ""),
                 mime_type=file_obj.get("mimetype"),
                 message_thread_id=TELEGRAM_HISTORY_THREAD_ID,
+                disable_notification=True,
             )
             time.sleep(BACKFILL_SEND_DELAY_SECONDS)
         except Exception as exc:

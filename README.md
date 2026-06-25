@@ -24,10 +24,11 @@ Telegram group
 
 ## What it forwards
 
-- Slack messages from a specific user
+- Slack messages from a specific user (just the message text — no header or permalink)
+- Slack `mrkdwn` formatting (`*bold*`, `_italic_`, `~strike~`, `` `code` ``, code blocks, links) rendered as Telegram HTML
 - Slack image attachments via Telegram `sendPhoto`
-- Other Slack file attachments via Telegram `sendDocument`
-- Slack message permalink when available
+- Other Slack file attachments (PDF, etc.) via Telegram `sendDocument`
+- Optional one-time history backfill of the target user's past messages into a separate Telegram topic, sent silently so subscribers aren't notified
 
 ---
 
@@ -257,150 +258,44 @@ SLACK_APP_TOKEN=xapp-your-slack-app-token
 TELEGRAM_BOT_TOKEN=123456789:your-telegram-bot-token
 TELEGRAM_CHAT_ID=-1001234567890
 TARGET_SLACK_USER_ID=U012ABCDEF
+
+# Optional: forum topic (thread) in the supergroup for LIVE forwards.
+# Leave blank for a normal group / the General topic.
+TELEGRAM_LIVE_THREAD_ID=
+
+# Optional: separate forum topic for the historical backfill.
+TELEGRAM_HISTORY_THREAD_ID=
 ```
 
-Do not commit this file to GitHub.
+Do not commit this file to GitHub. See `.env.example` for the full list of variables.
 
 ---
 
 ## `slack_to_telegram_bridge.py`
 
-```python
-import os
-import tempfile
-from pathlib import Path
+The full bridge implementation lives in [`slack_to_telegram_bridge.py`](slack_to_telegram_bridge.py). Run it with no arguments to start the live forwarder, or with the `backfill` subcommand (see below) to relay a channel's history.
 
-import requests
-from dotenv import load_dotenv
-from slack_bolt import App
-from slack_bolt.adapter.socket_mode import SocketModeHandler
+---
 
-load_dotenv()
+## History backfill
 
-SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
-SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-TARGET_SLACK_USER_ID = os.environ["TARGET_SLACK_USER_ID"]
+To relay all of the target user's past messages from a channel into Telegram (one time), run:
 
-app = App(token=SLACK_BOT_TOKEN)
-
-
-def tg_api(method: str) -> str:
-    return f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-
-
-def send_telegram_message(text: str) -> None:
-    response = requests.post(
-        tg_api("sendMessage"),
-        json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text[:4096],
-            "disable_web_page_preview": False,
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-
-
-def send_telegram_file(path: Path, caption: str, mime_type: str | None = None) -> None:
-    is_image = bool(mime_type and mime_type.startswith("image/"))
-    method = "sendPhoto" if is_image else "sendDocument"
-    field = "photo" if is_image else "document"
-
-    with path.open("rb") as f:
-        response = requests.post(
-            tg_api(method),
-            data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1024]},
-            files={field: (path.name, f, mime_type or "application/octet-stream")},
-            timeout=120,
-        )
-    response.raise_for_status()
-
-
-def download_slack_file(file_obj: dict) -> Path | None:
-    url = file_obj.get("url_private_download") or file_obj.get("url_private")
-    if not url:
-        return None
-
-    name = file_obj.get("name") or file_obj.get("title") or file_obj.get("id") or "slack_file"
-    safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
-    path = Path(tempfile.gettempdir()) / safe_name
-
-    response = requests.get(
-        url,
-        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
-        timeout=120,
-    )
-    response.raise_for_status()
-    path.write_bytes(response.content)
-    return path
-
-
-@app.event("message")
-def handle_message_events(event, say, logger):
-    ignored_subtypes = {
-        "message_changed",
-        "message_deleted",
-        "bot_message",
-        "channel_join",
-        "channel_leave",
-    }
-    if event.get("subtype") in ignored_subtypes:
-        return
-
-    user_id = event.get("user")
-    if user_id != TARGET_SLACK_USER_ID:
-        return
-
-    channel = event.get("channel", "unknown-channel")
-    text = event.get("text", "")
-    ts = event.get("ts", "")
-    permalink = None
-
-    try:
-        permalink_result = app.client.chat_getPermalink(channel=channel, message_ts=ts)
-        permalink = permalink_result.get("permalink")
-    except Exception as exc:
-        logger.warning(f"Could not get permalink: {exc}")
-
-    header = f"Slack message from <@{user_id}> in {channel}"
-    body = text.strip() or "[no text]"
-    if permalink:
-        body += f"\n\nSlack link: {permalink}"
-
-    send_telegram_message(f"{header}\n\n{body}")
-
-    for file_obj in event.get("files", []) or []:
-        try:
-            path = download_slack_file(file_obj)
-            if not path:
-                continue
-
-            caption_parts = [f"Attachment from <@{user_id}>"]
-            if file_obj.get("title"):
-                caption_parts.append(str(file_obj["title"]))
-            if permalink:
-                caption_parts.append(permalink)
-
-            send_telegram_file(
-                path=path,
-                caption="\n".join(caption_parts),
-                mime_type=file_obj.get("mimetype"),
-            )
-        except Exception as exc:
-            logger.exception(f"Failed to relay Slack file {file_obj.get('id')}: {exc}")
-            send_telegram_message(
-                "Failed to relay an attachment from Slack: "
-                f"{file_obj.get('name') or file_obj.get('id')}\n"
-                f"Error: {exc}"
-            )
-
-
-if __name__ == "__main__":
-    print("Starting Slack to Telegram bridge...")
-    SocketModeHandler(app, SLACK_APP_TOKEN).start()
+```bash
+python slack_to_telegram_bridge.py backfill <channel_id>
 ```
+
+- Backfilled messages are formatted as the message text followed by a blank line and a US Eastern timestamp, e.g.:
+
+  ```text
+  Test
+
+  2026-06-25 03:50 AM EDT
+  ```
+
+- They are sent with notifications disabled so existing subscribers are not pinged.
+- Set `TELEGRAM_HISTORY_THREAD_ID` to post the backfill into its own forum topic, keeping it separate from live forwards.
+- Already-relayed messages are tracked in a state file (`.backfill_state`), so re-running the command skips them. Delete that file to force a full re-send.
 
 ---
 
