@@ -172,31 +172,42 @@ def send_slack_text(
 
 def send_telegram_file(
     path: Path,
-    caption: str,
+    caption: str = "",
     mime_type: str | None = None,
     message_thread_id: int | None = None,
+    parse_mode: str | None = None,
     disable_notification: bool = False,
 ) -> None:
     is_image = bool(mime_type and mime_type.startswith("image/"))
     method = "sendPhoto" if is_image else "sendDocument"
     field = "photo" if is_image else "document"
 
-    data = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "caption": caption[:1024],
-        "disable_notification": disable_notification,
-    }
-    if message_thread_id is not None:
-        data["message_thread_id"] = message_thread_id
+    def _post(cap: str, mode: str | None) -> requests.Response:
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "caption": cap[:1024],
+            "disable_notification": disable_notification,
+        }
+        if mode:
+            data["parse_mode"] = mode
+        if message_thread_id is not None:
+            data["message_thread_id"] = message_thread_id
+        with path.open("rb") as f:
+            return requests.post(
+                tg_api(method),
+                data=data,
+                files={field: (path.name, f, mime_type or "application/octet-stream")},
+                timeout=120,
+            )
 
-    with path.open("rb") as f:
-        response = requests.post(
-            tg_api(method),
-            data=data,
-            files={field: (path.name, f, mime_type or "application/octet-stream")},
-            timeout=120,
-        )
-    response.raise_for_status()
+    try:
+        _post(caption, parse_mode).raise_for_status()
+    except requests.HTTPError as exc:
+        # Telegram rejects malformed caption HTML with 400; retry once as plain text.
+        if parse_mode and exc.response is not None and exc.response.status_code == 400:
+            _post(_html_to_plain(caption), None).raise_for_status()
+        else:
+            raise
 
 
 def download_slack_file(file_obj: dict) -> Path | None:
@@ -216,6 +227,97 @@ def download_slack_file(file_obj: dict) -> Path | None:
     response.raise_for_status()
     path.write_bytes(response.content)
     return path
+
+
+def relay_slack_message(
+    text: str,
+    files: list | None,
+    *,
+    message_thread_id: int | None = None,
+    suffix: str = "",
+    disable_notification: bool = False,
+    pace_seconds: float = 0.0,
+    on_file_error=None,
+) -> bool:
+    """Forward a Slack message (text + any attachments) to Telegram.
+
+    When the message carries an image, the text rides along as that image's
+    caption so they arrive as a single Telegram message (sending an image is
+    slow, and a separate text post would otherwise show up well ahead of it).
+    The Slack filename is never used as a caption — only the message text is.
+
+    Returns True if the message body was delivered (so the backfill can mark it
+    relayed); False if the body send failed and should be retried later.
+    """
+    files = list(files or [])
+    body_html = convert_mrkdwn_to_html((text or "").strip())
+    if body_html and suffix:
+        caption = f"{body_html}{suffix}"
+    elif body_html:
+        caption = body_html
+    else:
+        caption = suffix.lstrip("\n")
+
+    # Telegram caps captions at 1024 chars; only ride the text along with the
+    # first image when it fits, otherwise post it as its own message.
+    first_image_index = next(
+        (i for i, f in enumerate(files) if (f.get("mimetype") or "").startswith("image/")),
+        None,
+    )
+    caption_on_image = first_image_index is not None and len(caption) <= 1024
+
+    body_sent = False
+
+    def _send_text_standalone() -> None:
+        nonlocal body_sent
+        send_slack_text(
+            text,
+            suffix=suffix,
+            message_thread_id=message_thread_id,
+            disable_notification=disable_notification,
+        )
+        body_sent = True
+
+    if not caption_on_image:
+        try:
+            _send_text_standalone()
+        except Exception as exc:
+            if on_file_error is not None:
+                on_file_error(None, exc)
+            return False
+
+    for index, file_obj in enumerate(files):
+        is_caption_image = caption_on_image and index == first_image_index
+        try:
+            path = download_slack_file(file_obj)
+            if not path:
+                if is_caption_image:
+                    # Couldn't fetch the image; still deliver the text so it isn't lost.
+                    _send_text_standalone()
+                continue
+            send_telegram_file(
+                path=path,
+                caption=caption if is_caption_image else "",
+                parse_mode="HTML" if is_caption_image else None,
+                mime_type=file_obj.get("mimetype"),
+                message_thread_id=message_thread_id,
+                disable_notification=disable_notification,
+            )
+            if is_caption_image:
+                body_sent = True
+            if pace_seconds:
+                time.sleep(pace_seconds)
+        except Exception as exc:
+            if is_caption_image and not body_sent:
+                # The captioned image failed; fall back to a standalone text post.
+                try:
+                    _send_text_standalone()
+                except Exception:
+                    pass
+            if on_file_error is not None:
+                on_file_error(file_obj, exc)
+
+    return body_sent
 
 
 @app.event("message")
@@ -245,31 +347,25 @@ def handle_message_events(event, say, logger):
 
     text = event.get("text", "")
 
+    def _on_file_error(file_obj, exc):
+        logger.exception("Failed to relay Slack attachment: %s", exc)
+        if file_obj is None:
+            return
+        send_telegram_message(
+            "Failed to relay an attachment from Slack: "
+            f"{file_obj.get('name') or file_obj.get('id')}\n"
+            f"Error: {exc}",
+            message_thread_id=TELEGRAM_LIVE_THREAD_ID,
+        )
+
     # Forward only the message itself — no Slack header, no permalink line.
-    send_slack_text(text, message_thread_id=TELEGRAM_LIVE_THREAD_ID)
-
-    for file_obj in event.get("files", []) or []:
-        try:
-            path = download_slack_file(file_obj)
-            if not path:
-                continue
-
-            # Any non-image (PDF, etc.) is relayed as a document; images as photos.
-            caption = str(file_obj.get("title") or "")
-            send_telegram_file(
-                path=path,
-                caption=caption,
-                mime_type=file_obj.get("mimetype"),
-                message_thread_id=TELEGRAM_LIVE_THREAD_ID,
-            )
-        except Exception as exc:
-            logger.exception(f"Failed to relay Slack file {file_obj.get('id')}: {exc}")
-            send_telegram_message(
-                "Failed to relay an attachment from Slack: "
-                f"{file_obj.get('name') or file_obj.get('id')}\n"
-                f"Error: {exc}",
-                message_thread_id=TELEGRAM_LIVE_THREAD_ID,
-            )
+    # An image carries the text as its caption (one combined Telegram message).
+    relay_slack_message(
+        text,
+        event.get("files"),
+        message_thread_id=TELEGRAM_LIVE_THREAD_ID,
+        on_file_error=_on_file_error,
+    )
 
 
 def _slack_call(method, **kwargs):
@@ -360,38 +456,22 @@ def _relay_history_message(channel: str, msg: dict) -> bool:
 
     # Format: the message, then a blank line, then the timestamp. Backfill posts
     # silently (disable_notification) so subscribers aren't pinged for old messages.
+    # When the message has an image, the text+timestamp ride as its caption.
     suffix = f"\n\n{when}" if when else ""
 
-    try:
-        send_slack_text(
-            text,
-            suffix=suffix,
-            message_thread_id=TELEGRAM_HISTORY_THREAD_ID,
-            disable_notification=True,
-        )
-    except Exception as exc:
-        print(f"Failed to send message {ts} to Telegram: {exc}")
-        return False
+    def _on_file_error(file_obj, exc):
+        ident = file_obj.get("id") if file_obj else ts
+        print(f"Failed to relay {ident} to Telegram: {exc}")
 
-    for file_obj in msg.get("files", []) or []:
-        try:
-            path = download_slack_file(file_obj)
-            if not path:
-                continue
-
-            # Images go as photos, everything else (PDF, etc.) as a document.
-            send_telegram_file(
-                path=path,
-                caption=str(file_obj.get("title") or ""),
-                mime_type=file_obj.get("mimetype"),
-                message_thread_id=TELEGRAM_HISTORY_THREAD_ID,
-                disable_notification=True,
-            )
-            time.sleep(BACKFILL_SEND_DELAY_SECONDS)
-        except Exception as exc:
-            print(f"Failed to relay file {file_obj.get('id')}: {exc}")
-
-    return True
+    return relay_slack_message(
+        text,
+        msg.get("files"),
+        message_thread_id=TELEGRAM_HISTORY_THREAD_ID,
+        suffix=suffix,
+        disable_notification=True,
+        pace_seconds=BACKFILL_SEND_DELAY_SECONDS,
+        on_file_error=_on_file_error,
+    )
 
 
 def backfill_channel(channel: str) -> None:
