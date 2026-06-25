@@ -278,7 +278,13 @@ Do not commit this file to GitHub. See `.env.example` for the full list of varia
 
 ## `slack_to_telegram_bridge.py`
 
-The full bridge implementation lives in [`slack_to_telegram_bridge.py`](slack_to_telegram_bridge.py). Run it with no arguments to start the live forwarder, or with the `backfill` subcommand (see below) to relay a channel's history.
+The full bridge implementation lives in [`slack_to_telegram_bridge.py`](slack_to_telegram_bridge.py). It supports a few command-line modes:
+
+| Command | What it does |
+| --- | --- |
+| `python slack_to_telegram_bridge.py` | Start the live forwarder (no arguments). |
+| `python slack_to_telegram_bridge.py backfill <channel_id>` | Relay a channel's history once (see [History backfill](#history-backfill)). |
+| `python slack_to_telegram_bridge.py replay-failed` | Re-send live messages previously logged as `failed` (see [Replay failed messages](#replay-failed-messages)). |
 
 ---
 
@@ -301,6 +307,21 @@ python slack_to_telegram_bridge.py backfill <channel_id>
 - They are sent with notifications disabled so existing subscribers are not pinged.
 - Set `TELEGRAM_HISTORY_THREAD_ID` to post the backfill into its own forum topic, keeping it separate from live forwards.
 - Already-relayed messages are tracked in a state file (`.backfill_state`) **and** in `backfill_messages.csv` (see below). Re-running the command skips any message recorded as sent in either. Delete both to force a full re-send.
+
+---
+
+## Replay failed messages
+
+If a live forward fails (e.g. Telegram was briefly unreachable), the message is recorded in `realtime_messages.csv` with a `failed` status. To re-send any such messages that were never later delivered, run:
+
+```bash
+python slack_to_telegram_bridge.py replay-failed
+```
+
+- It re-posts to the live Telegram thread (`TELEGRAM_LIVE_THREAD_ID`).
+- The CSV stores only message text, so each message is **re-read from Slack first** to recover its attachments. Image/file-only messages are replayed too, with the image carrying any text as its caption — exactly as the live forwarder sends them.
+- If a message can no longer be re-read from Slack (e.g. it was deleted), the text the CSV preserved is replayed on its own; if there is neither text nor an attachment to send, it is skipped.
+- Each successful resend is appended to the ledger as a new `sent` row, so re-running the command skips messages already delivered.
 
 ---
 
